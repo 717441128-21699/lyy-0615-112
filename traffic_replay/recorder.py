@@ -152,14 +152,11 @@ class Recorder:
         except Exception as e:
             logger.warning(f"Failed to read request body: {e}")
 
-        if self.mode == RecordingMode.TAP:
-            asyncio.create_task(self._tap_request(request, record))
-            return await self._proxy_request(request, record)
-        else:
-            return await self._proxy_request(request, record)
+        return await self._proxy_request(request, record, body=record.body)
 
     async def _proxy_request(
-        self, request: web.Request, record: Optional[RequestRecord] = None
+        self, request: web.Request, record: Optional[RequestRecord] = None,
+        body: Optional[bytes] = None,
     ) -> web.Response:
         path = request.match_info.get("path", "")
         target_url = f"{self.target_url}/{path}"
@@ -171,8 +168,7 @@ class Recorder:
                    if k.lower() not in ("host", "content-length", "connection")}
         headers["Host"] = self._extract_host(self.target_url)
 
-        body = None
-        if request.method in ("POST", "PUT", "PATCH"):
+        if body is None and request.method in ("POST", "PUT", "PATCH"):
             try:
                 body = await request.read()
             except Exception:
@@ -205,8 +201,13 @@ class Recorder:
                     if self.masking_engine:
                         record = await self.masking_engine.mask_record(record)
 
-                    if self._record_queue and not self._record_queue.full():
-                        self._record_queue.put_nowait(record)
+                    if self._record_queue is not None:
+                        if self.mode == RecordingMode.TAP and self._record_queue.full():
+                            pass
+                        elif not self._record_queue.full():
+                            self._record_queue.put_nowait(record)
+                        else:
+                            asyncio.create_task(self.storage.append(record))
                     else:
                         asyncio.create_task(self.storage.append(record))
 
@@ -230,10 +231,6 @@ class Recorder:
                 if self._record_queue and not self._record_queue.full():
                     self._record_queue.put_nowait(record)
             return web.Response(status=502, text="Bad Gateway")
-
-    async def _tap_request(self, request: web.Request, record: RequestRecord) -> None:
-        if self._record_queue and not self._record_queue.full():
-            self._record_queue.put_nowait(record)
 
     async def _recording_worker(self, worker_id: int) -> None:
         logger.debug(f"Recording worker {worker_id} started")

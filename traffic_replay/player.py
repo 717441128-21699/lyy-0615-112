@@ -1,6 +1,7 @@
 import asyncio
 import time
 import logging
+import re
 import statistics
 from typing import Optional, Dict, Any, List, Callable, Tuple
 from enum import Enum
@@ -150,6 +151,54 @@ class Player:
         await self.stop()
         return self._generate_report(all_results)
 
+    def _build_dependency_graph(
+        self, records: List[RequestRecord]
+    ) -> Dict[str, List[str]]:
+        if not self.context_manager:
+            return {r.id: [] for r in records}
+
+        dependencies: Dict[str, List[str]] = {}
+        var_producers: Dict[str, str] = {}
+        record_by_id: Dict[str, RequestRecord] = {r.id: r for r in records}
+
+        for record in records:
+            deps = set()
+
+            if record.body:
+                try:
+                    body_str = record.body.decode("utf-8") if isinstance(record.body, bytes) else record.body
+                    placeholders = re.findall(r'\{\{(\w+)\}\}', body_str)
+                    for var in placeholders:
+                        if var in var_producers:
+                            deps.add(var_producers[var])
+                except (UnicodeDecodeError, AttributeError):
+                    pass
+
+            for h_key, h_value in record.headers.items():
+                if isinstance(h_value, str):
+                    placeholders = re.findall(r'\{\{(\w+)\}\}', h_value)
+                    for var in placeholders:
+                        if var in var_producers:
+                            deps.add(var_producers[var])
+
+            if record.url:
+                placeholders = re.findall(r'\{\{(\w+)\}\}', record.url)
+                for var in placeholders:
+                    if var in var_producers:
+                        deps.add(var_producers[var])
+
+            dependencies[record.id] = list(deps)
+
+            for rule in self.context_manager.extraction_rules:
+                var_producers[rule.variable_name] = record.id
+
+            if self.context_manager.enable_auto_extract:
+                auto_vars = ["auto_token", "auto_access_token", "auto_id", "auto_uuid"]
+                for v in auto_vars:
+                    var_producers[v] = record.id
+
+        return dependencies
+
     async def _play_precise_timing(self, records: List[RequestRecord]) -> List[Dict[str, Any]]:
         if not records:
             return []
@@ -157,6 +206,29 @@ class Player:
         base_timestamp = records[0].timestamp
         start_mono = time.monotonic()
 
+        if self.context_manager:
+            global_session_id = "playback_global_session"
+            if not self.context_manager.get_context(global_session_id):
+                self.context_manager.create_context(
+                    session_id=global_session_id,
+                    recording_env="recording",
+                    playback_env="playback",
+                )
+            for record in records:
+                if not record.session_id:
+                    record.session_id = global_session_id
+
+        dep_graph = self._build_dependency_graph(records)
+        has_deps = any(deps for deps in dep_graph.values())
+
+        if not has_deps:
+            return await self._play_precise_no_deps(records, base_timestamp, start_mono)
+        else:
+            return await self._play_precise_with_deps(records, dep_graph, base_timestamp, start_mono)
+
+    async def _play_precise_no_deps(
+        self, records: List[RequestRecord], base_timestamp: float, start_mono: float
+    ) -> List[Dict[str, Any]]:
         tasks = []
         scheduled_count = 0
 
@@ -186,6 +258,59 @@ class Player:
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return [r for r in results if isinstance(r, dict)]
+
+    async def _play_precise_with_deps(
+        self,
+        records: List[RequestRecord],
+        dep_graph: Dict[str, List[str]],
+        base_timestamp: float,
+        start_mono: float,
+    ) -> List[Dict[str, Any]]:
+        results_by_id: Dict[str, Dict[str, Any]] = {}
+        completed_events: Dict[str, asyncio.Event] = {
+            r.id: asyncio.Event() for r in records
+        }
+        record_by_id: Dict[str, RequestRecord] = {r.id: r for r in records}
+        tasks: Dict[str, asyncio.Task] = {}
+
+        async def schedule_with_deps(record: RequestRecord):
+            record_id = record.id
+            deps = dep_graph.get(record_id, [])
+
+            for dep_id in deps:
+                if dep_id in completed_events:
+                    await completed_events[dep_id].wait()
+
+            relative_offset = (record.timestamp - base_timestamp) / self.speed_factor
+            target_mono = start_mono + relative_offset
+
+            current_mono = time.monotonic()
+            sleep_time = target_mono - current_mono
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+
+            actual_mono = time.monotonic()
+            timing_deviation = (actual_mono - target_mono) * 1000
+            self._timing_deviations.append(timing_deviation)
+
+            result = await self._execute_request(record, timing_deviation)
+            results_by_id[record_id] = result
+            completed_events[record_id].set()
+            return result
+
+        for record in records:
+            if not self._running:
+                break
+            task = asyncio.create_task(schedule_with_deps(record))
+            tasks[record.id] = task
+
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+        results = []
+        for record in records:
+            if record.id in results_by_id:
+                results.append(results_by_id[record.id])
+        return results
 
     async def _play_fixed_qps(self, records: List[RequestRecord], qps: int = 100) -> List[Dict[str, Any]]:
         if not records:

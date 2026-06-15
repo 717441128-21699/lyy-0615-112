@@ -195,12 +195,34 @@ class MaskingEngine:
             masked_values = []
             for value in values:
                 masked_value = value
+                matched = False
+
                 for rule in self.rules:
                     if hasattr(rule, 'source') and rule.source == "query_param" and rule.selector.lower() in key.lower():
                         masked_value = self._apply_mask_to_value(
                             value, rule.mask_type, rule.preserve_length, rule.replacement
                         )
+                        matched = True
                         break
+
+                if not matched:
+                    for pattern_name, pattern in self._builtin_patterns.items():
+                        if pattern_name in key.lower():
+                            masked_value = self._apply_mask_to_value(
+                                value, MaskType.MASK, preserve_length=True
+                            )
+                            matched = True
+                            break
+
+                if not matched:
+                    for pattern_name, pattern in self._builtin_patterns.items():
+                        if pattern.search(value):
+                            masked_value = self._apply_mask_to_value(
+                                value, MaskType.MASK, preserve_length=True
+                            )
+                            matched = True
+                            break
+
                 masked_values.append(masked_value)
             masked_params[key] = masked_values
 
@@ -358,7 +380,7 @@ class MaskingEngine:
         else:
             return self._faker.word()
 
-    def _mask_session_id(self, session_id: Optional[str]) -> Optional[str]:
+    async def _mask_session_id(self, session_id: Optional[str]) -> Optional[str]:
         if not session_id:
             return session_id
         return self._hash_string(session_id)

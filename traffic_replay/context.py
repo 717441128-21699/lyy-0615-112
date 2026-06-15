@@ -243,6 +243,9 @@ class ContextManager:
             if placeholder in new_url:
                 new_url = new_url.replace(placeholder, str_value)
 
+        new_headers = self._auto_inject_headers(new_headers, context)
+        new_body = self._auto_inject_body(new_body, context)
+
         new_url = self._apply_env_mapping(new_url, context)
         new_headers = self._apply_env_mapping_to_headers(new_headers, context)
 
@@ -262,6 +265,115 @@ class ContextManager:
             upstream_latency_ms=record.upstream_latency_ms,
             tags=record.tags,
         )
+
+    def _auto_inject_headers(
+        self, headers: Dict[str, str], context: SessionContext
+    ) -> Dict[str, str]:
+        if not context.variables:
+            return headers
+
+        new_headers = dict(headers)
+        vars_lower = {k.lower(): v for k, v in context.variables.items()}
+
+        token_value = None
+        for var_name in ["auth_token", "auto_auth_token", "access_token", "auto_access_token",
+                         "auto_x_auth_token", "auto_token", "token", "auto_authorization"]:
+            if var_name in vars_lower:
+                token_value = str(vars_lower[var_name])
+                break
+
+        if token_value:
+            has_auth = False
+            has_x_auth = False
+            has_token = False
+
+            for h_key in list(new_headers.keys()):
+                h_lower = h_key.lower()
+                if h_lower == "authorization":
+                    if token_value.startswith("Bearer "):
+                        new_headers[h_key] = token_value
+                    else:
+                        new_headers[h_key] = f"Bearer {token_value}"
+                    has_auth = True
+                elif h_lower == "x-auth-token":
+                    new_headers[h_key] = token_value
+                    has_x_auth = True
+                elif h_lower == "x-access-token":
+                    new_headers[h_key] = token_value
+                elif h_lower == "token":
+                    new_headers[h_key] = token_value
+                    has_token = True
+
+            if not has_x_auth and not has_auth and not has_token:
+                new_headers["X-Auth-Token"] = token_value
+
+        cookie_vars = [k for k in vars_lower if "cookie" in k or "session" in k]
+        if cookie_vars:
+            cookie_value = str(vars_lower[cookie_vars[0]])
+            has_cookie = False
+            for h_key in new_headers:
+                if h_key.lower() == "cookie":
+                    new_headers[h_key] = cookie_value
+                    has_cookie = True
+                    break
+            if not has_cookie and "=" in cookie_value:
+                new_headers["Cookie"] = cookie_value
+
+        return new_headers
+
+    def _auto_inject_body(
+        self, body: Optional[Union[str, bytes]], context: SessionContext
+    ) -> Optional[Union[str, bytes]]:
+        if body is None or not context.variables:
+            return body
+
+        is_bytes = isinstance(body, bytes)
+        if is_bytes:
+            try:
+                body_str = body.decode("utf-8")
+            except UnicodeDecodeError:
+                return body
+        else:
+            body_str = body
+
+        if self._is_json(body_str):
+            try:
+                data = json.loads(body_str)
+                data = self._auto_inject_json(data, context)
+                result = json.dumps(data, ensure_ascii=False)
+                return result.encode("utf-8") if is_bytes else result
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        return body
+
+    def _auto_inject_json(self, data: Any, context: SessionContext) -> Any:
+        if isinstance(data, dict):
+            result = {}
+            for key, value in data.items():
+                key_lower = key.lower()
+                injected = False
+
+                for var_name, var_value in context.variables.items():
+                    var_lower = var_name.lower().replace("auto_", "")
+                    if var_lower in key_lower and isinstance(var_value, str):
+                        if key_lower in ("token", "access_token", "authtoken",
+                                         "user_id", "userid", "uuid"):
+                            result[key] = var_value
+                            injected = True
+                            break
+
+                if not injected:
+                    result[key] = self._auto_inject_json(value, context)
+            return result
+        elif isinstance(data, list):
+            return [self._auto_inject_json(item, context) for item in data]
+        else:
+            return data
+
+    def _is_json(self, s: str) -> bool:
+        s = s.strip()
+        return (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]"))
 
     def _apply_env_mapping(self, url: str, context: SessionContext) -> str:
         if not context.env_mappings:
