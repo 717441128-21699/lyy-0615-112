@@ -1,0 +1,116 @@
+recorder:
+  target_url: "http://prod.example.com"
+  listen_host: "0.0.0.0"
+  listen_port: 8080
+  mode: "tap"
+  sample_rate: 1.0
+  capture_response: true
+  max_body_size: 10485760
+  timeout_ms: 30000
+  num_workers: 10
+
+storage:
+  base_dir: "./recordings"
+  batch_size: 100
+  flush_interval_ms: 500
+  compress: true
+  max_memory_mb: 100
+
+player:
+  target_url: "http://test.example.com"
+  mode: "precise"
+  speed_factor: 1.0
+  max_concurrent: 100
+  timeout_ms: 30000
+  retry_count: 0
+  retry_delay_ms: 1000
+  ignore_ssl: false
+  loop_count: 1
+
+masking:
+  enabled: true
+  preserve_structure: true
+  default_mask_char: "*"
+  hash_algorithm: "sha256"
+  hash_salt: "your_secret_salt_here"
+  locale: "zh_CN"
+  rules:
+    - name: "mask_password"
+      selector: "password"
+      mask_type: "hash"
+      preserve_length: false
+      description: "Hash all password fields"
+
+    - name: "mask_phone"
+      selector: "phone"
+      mask_type: "mask"
+      pattern: "1[3-9]\\d{9}"
+      preserve_length: true
+      description: "Mask Chinese phone numbers"
+
+    - name: "mask_email"
+      selector: "email"
+      mask_type: "mask"
+      preserve_length: true
+      description: "Mask email addresses"
+
+    - name: "mask_id_card"
+      selector: "id_card"
+      mask_type: "mask"
+      pattern: "\\d{17}[\\dXx]"
+      preserve_length: true
+      description: "Mask Chinese ID card numbers"
+
+    - name: "mask_bank_card"
+      selector: "bank_card"
+      mask_type: "mask"
+      pattern: "\\d{16,19}"
+      preserve_length: true
+      description: "Mask bank card numbers"
+
+    - name: "redact_secret_keys"
+      selector: "secret_key"
+      mask_type: "redact"
+      description: "Remove secret keys completely"
+
+context:
+  enabled: true
+  enable_auto_extract: true
+  variable_ttl_seconds: 3600
+  env_mappings:
+    "prod.example.com": "test.example.com"
+    "prod-api.internal.com": "test-api.internal.com"
+
+  extraction_rules:
+    - name: "extract_auth_token"
+      source: "header"
+      selector: "X-Auth-Token"
+      variable_name: "auth_token"
+      description: "Extract auth token from response headers"
+
+    - name: "extract_bearer_token"
+      source: "header"
+      selector: "Authorization"
+      variable_name: "bearer_token"
+      description: "Extract Bearer token from Authorization header"
+
+    - name: "extract_user_id"
+      source: "json_body"
+      selector: "$.data.user_id"
+      variable_name: "user_id"
+      description: "Extract user_id from JSON response body"
+
+    - name: "extract_order_id"
+      source: "json_body"
+      selector: "$.data.order_id"
+      variable_name: "order_id"
+      description: "Extract order_id from JSON response body"
+
+    - name: "extract_session_cookie"
+      source: "header"
+      selector: "Set-Cookie"
+      variable_name: "session_cookie"
+      description: "Extract session cookie from response"
+
+log_level: "INFO"
+log_file: null
