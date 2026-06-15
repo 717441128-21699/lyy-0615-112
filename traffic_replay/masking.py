@@ -4,6 +4,7 @@ import hashlib
 import logging
 import random
 import string
+from datetime import datetime
 from typing import Optional, Dict, Any, List, Union, Pattern
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from dataclasses import dataclass
@@ -57,6 +58,11 @@ class MaskingEngine:
 
         self._compile_rules()
         self._init_builtin_patterns()
+        self._luhn_digits = list("0123456789")
+        self._phone_prefixes = ["130", "131", "132", "133", "134", "135", "136", "137", "138", "139",
+                                 "150", "151", "152", "153", "155", "156", "157", "158", "159",
+                                 "170", "171", "173", "175", "176", "177", "178", "180", "181",
+                                 "182", "183", "184", "185", "186", "187", "188", "189", "198", "199"]
 
     def _compile_rules(self) -> None:
         for rule in self.rules:
@@ -206,20 +212,68 @@ class MaskingEngine:
                         break
 
                 if not matched:
+                    key_lower = key.lower()
+                    if "phone" in key_lower or "mobile" in key_lower or "tel" in key_lower:
+                        if self._builtin_patterns["phone"].search(value):
+                            masked_value = self._generate_valid_phone(value)
+                            matched = True
+
+                if not matched:
+                    key_lower = key.lower()
+                    if "id" in key_lower and ("card" in key_lower or "cert" in key_lower):
+                        if self._builtin_patterns["id_card"].search(value):
+                            masked_value = self._generate_valid_id_card(value)
+                            matched = True
+
+                if not matched:
+                    key_lower = key.lower()
+                    if "bank" in key_lower or "card" in key_lower or "credit" in key_lower:
+                        if self._builtin_patterns["bank_card"].search(value):
+                            masked_value = self._generate_valid_bank_card(value)
+                            matched = True
+
+                if not matched:
                     for pattern_name, pattern in self._builtin_patterns.items():
                         if pattern_name in key.lower():
-                            masked_value = self._apply_mask_to_value(
-                                value, MaskType.MASK, preserve_length=True
-                            )
-                            matched = True
-                            break
+                            if pattern_name == "email":
+                                if pattern.search(value):
+                                    masked_value = self._generate_valid_email(value)
+                                    matched = True
+                                    break
+                            elif pattern_name == "ipv4":
+                                if pattern.search(value):
+                                    masked_value = self._generate_valid_ipv4(value)
+                                    matched = True
+                                    break
+                            elif pattern_name == "password" or pattern_name == "token":
+                                if pattern.search(value) or True:
+                                    masked_value = self._generate_valid_token(value)
+                                    matched = True
+                                    break
+                            else:
+                                masked_value = self._apply_mask_to_value(
+                                    value, MaskType.MASK, preserve_length=True
+                                )
+                                matched = True
+                                break
 
                 if not matched:
                     for pattern_name, pattern in self._builtin_patterns.items():
                         if pattern.search(value):
-                            masked_value = self._apply_mask_to_value(
-                                value, MaskType.MASK, preserve_length=True
-                            )
+                            if pattern_name == "phone":
+                                masked_value = self._generate_valid_phone(value)
+                            elif pattern_name == "id_card":
+                                masked_value = self._generate_valid_id_card(value)
+                            elif pattern_name == "email":
+                                masked_value = self._generate_valid_email(value)
+                            elif pattern_name == "bank_card":
+                                masked_value = self._generate_valid_bank_card(value)
+                            elif pattern_name == "ipv4":
+                                masked_value = self._generate_valid_ipv4(value)
+                            else:
+                                masked_value = self._apply_mask_to_value(
+                                    value, MaskType.MASK, preserve_length=True
+                                )
                             matched = True
                             break
 
@@ -229,6 +283,140 @@ class MaskingEngine:
         new_query = urlencode(masked_params, doseq=True)
 
         return urlunparse(parsed._replace(query=new_query))
+
+    def _stable_random(self, seed: str) -> random.Random:
+        return random.Random(hash(seed) & 0xFFFFFFFF)
+
+    def _generate_valid_phone(self, original: str) -> str:
+        rng = self._stable_random(original)
+        prefix = rng.choice(self._phone_prefixes)
+        suffix = "".join(rng.choices(string.digits, k=8))
+        return prefix + suffix
+
+    def _generate_valid_id_card(self, original: str) -> str:
+        rng = self._stable_random(original)
+
+        area_codes = ["110101", "310101", "440101", "320102", "330102",
+                      "510104", "420102", "440303", "370102", "500103"]
+        area_code = rng.choice(area_codes)
+
+        try:
+            base_year = int(original[6:10]) if len(original) >= 14 else 1990
+        except (ValueError, IndexError):
+            base_year = 1990
+
+        if not (1950 <= base_year <= 2010):
+            base_year = rng.randint(1970, 2005)
+
+        month = rng.randint(1, 12)
+        day = rng.randint(1, 28)
+        birth_date = f"{base_year:04d}{month:02d}{day:02d}"
+
+        sequence = "".join(rng.choices(string.digits, k=3))
+
+        first17 = area_code + birth_date + sequence
+
+        total = 0
+        weights = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
+        for i, c in enumerate(first17):
+            if c.isdigit():
+                total += int(c) * weights[i]
+
+        check_codes = "10X98765432"
+        check_code = check_codes[total % 11]
+
+        return first17 + check_code
+
+    def _generate_valid_bank_card(self, original: str) -> str:
+        rng = self._stable_random(original)
+
+        bin_prefixes = ["622202", "621700", "622848", "621661", "622588",
+                        "622622", "622516", "621977", "622506", "621226"]
+        bin_prefix = rng.choice(bin_prefixes)
+
+        total_length = len(original) if 16 <= len(original) <= 19 else 16
+
+        remaining = total_length - len(bin_prefix) - 1
+        random_part = "".join(rng.choices(string.digits, k=max(remaining, 1)))
+
+        first_part = bin_prefix + random_part
+
+        total = 0
+        for i, c in enumerate(reversed(first_part)):
+            if c.isdigit():
+                n = int(c)
+                if i % 2 == 0:
+                    n *= 2
+                    if n > 9:
+                        n -= 9
+                total += n
+
+        check_digit = (10 - (total % 10)) % 10
+
+        result = first_part + str(check_digit)
+        return result[:total_length].ljust(total_length, '0')
+
+    def _generate_valid_email(self, original: str) -> str:
+        rng = self._stable_random(original)
+
+        domains = ["qq.com", "163.com", "gmail.com", "outlook.com", "sina.com",
+                   "hotmail.com", "foxmail.com", "126.com", "yeah.net", "icloud.com"]
+
+        local_chars = string.ascii_lowercase + string.digits
+        local_length = rng.randint(6, 12)
+        local = "".join(rng.choices(local_chars, k=local_length))
+
+        if "@" in original:
+            parts = original.split("@", 1)
+            original_domain = parts[-1].split(".")[0] if "." in parts[-1] else ""
+            valid_domains = [d for d in domains if original_domain not in d]
+            if valid_domains:
+                domain = rng.choice(valid_domains)
+            else:
+                domain = rng.choice(domains)
+        else:
+            domain = rng.choice(domains)
+
+        return f"{local}@{domain}"
+
+    def _generate_valid_ipv4(self, original: str) -> str:
+        rng = self._stable_random(original)
+
+        private_prefixes = [10, 172, 192]
+        test_prefixes = [198, 203, 192]
+
+        first_octet = rng.choice(private_prefixes)
+
+        if first_octet == 10:
+            octets = [10, rng.randint(0, 255), rng.randint(0, 255), rng.randint(1, 254)]
+        elif first_octet == 172:
+            octets = [172, rng.randint(16, 31), rng.randint(0, 255), rng.randint(1, 254)]
+        else:
+            octets = [192, 168, rng.randint(0, 255), rng.randint(1, 254)]
+
+        return ".".join(str(o) for o in octets)
+
+    def _generate_valid_token(self, original: str) -> str:
+        rng = self._stable_random(original)
+
+        if len(original) == 0:
+            return "tkn_" + "".join(rng.choices(string.ascii_letters + string.digits, k=32))
+
+        token_chars = string.ascii_letters + string.digits
+        length = max(len(original), 32)
+
+        prefixes = ["tkn_", "tok_", "Bearer ", "sk_", "pk_"]
+        has_prefix = False
+        for p in prefixes:
+            if original.startswith(p):
+                result = p + "".join(rng.choices(token_chars, k=length - len(p)))
+                has_prefix = True
+                break
+
+        if not has_prefix:
+            result = "".join(rng.choices(token_chars, k=length))
+
+        return result[:max(len(original), 16)]
 
     async def _mask_json(self, data: Any) -> Any:
         if isinstance(data, dict):

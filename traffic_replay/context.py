@@ -184,29 +184,97 @@ class ContextManager:
     ) -> Dict[str, Any]:
         extracted = {}
 
-        auth_headers = ["authorization", "x-auth-token", "x-access-token"]
+        auth_headers = ["authorization", "x-auth-token", "x-access-token",
+                        "x_security_token", "authentication"]
         for h_key, h_value in response_headers.items():
             if h_key.lower() in auth_headers:
                 token_name = h_key.lower().replace("-", "_")
-                extracted[f"auto_{token_name}"] = h_value
+                clean_value = h_value
+                if "bearer " in h_value.lower():
+                    clean_value = h_value[7:] if len(h_value) > 7 else h_value
+                extracted[f"auto_{token_name}"] = clean_value
+                if "token" not in extracted:
+                    extracted["auth_token"] = clean_value
 
         set_cookie = response_headers.get("Set-Cookie") or response_headers.get("set-cookie")
         if set_cookie:
             cookie_match = re.search(r'(\w+)=([^;]+)', set_cookie)
             if cookie_match:
-                extracted[f"auto_cookie_{cookie_match.group(1)}"] = cookie_match.group(2)
+                cookie_name = cookie_match.group(1).lower()
+                cookie_value = cookie_match.group(2)
+                extracted[f"auto_cookie_{cookie_name}"] = cookie_value
+                if "session" in cookie_name or "token" in cookie_name:
+                    if "auth_token" not in extracted:
+                        extracted["auth_token"] = cookie_value
 
-        try:
-            body_json = json.loads(response_body.decode("utf-8"))
-            if isinstance(body_json, dict):
-                token_fields = ["token", "accessToken", "access_token", "id", "uuid"]
-                for field in token_fields:
-                    if field in body_json:
-                        extracted[f"auto_{field}"] = body_json[field]
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            pass
+        self._recursive_extract_json(None, response_body, extracted)
 
         return extracted
+
+    def _recursive_extract_json(
+        self, parent_key: Optional[str], data: Any, extracted: Dict[str, Any]
+    ) -> None:
+        if isinstance(data, (bytes, bytearray)):
+            try:
+                body_json = json.loads(data.decode("utf-8"))
+                self._recursive_extract_json("root", body_json, extracted)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return
+            return
+
+        priority_token_fields = {
+            "token", "access_token", "accesstoken", "access_token",
+            "auth_token", "authtoken", "jwt_token", "jwt",
+            "api_token", "apitoken", "session_token", "sessiontoken",
+        }
+
+        priority_id_fields = {
+            "user_id", "userid", "useruuid", "user_uuid",
+            "uid", "account_id", "accountid", "member_id", "memberid",
+        }
+
+        other_id_fields = {
+            "id", "uuid", "order_id", "orderid",
+            "product_id", "productid", "biz_id", "bizid",
+        }
+
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if not isinstance(key, str):
+                    continue
+
+                key_lower = key.lower().replace("-", "_")
+                key_clean = key_lower.replace("_", "")
+
+                if isinstance(value, str):
+                    if key_lower in priority_token_fields or key_clean in priority_token_fields:
+                        if "auth_token" not in extracted:
+                            extracted["auth_token"] = value
+                        if f"auto_{key_lower}" not in extracted:
+                            extracted[f"auto_{key_lower}"] = value
+
+                    elif key_lower in priority_id_fields or key_clean in priority_id_fields:
+                        if "user_id" not in extracted:
+                            extracted["user_id"] = value
+                        if f"auto_{key_lower}" not in extracted:
+                            extracted[f"auto_{key_lower}"] = value
+
+                    elif key_lower in other_id_fields or key_clean in other_id_fields:
+                        if parent_key == "data" or parent_key == "result":
+                            if key_lower == "id" and "user_id" not in extracted:
+                                extracted["auto_id"] = value
+                            else:
+                                extracted[f"auto_{key_lower}"] = value
+                        else:
+                            extracted[f"auto_{key_lower}"] = value
+
+                if isinstance(value, (dict, list)):
+                    self._recursive_extract_json(key_lower, value, extracted)
+
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, (dict, list)):
+                    self._recursive_extract_json(parent_key, item, extracted)
 
     async def apply_context(
         self, record: RequestRecord, context: SessionContext

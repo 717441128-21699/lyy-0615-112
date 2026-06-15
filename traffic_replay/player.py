@@ -159,7 +159,20 @@ class Player:
 
         dependencies: Dict[str, List[str]] = {}
         var_producers: Dict[str, str] = {}
-        record_by_id: Dict[str, RequestRecord] = {r.id: r for r in records}
+
+        auth_header_names = {
+            "authorization", "x-auth-token", "x-access-token", "x-api-key",
+            "token", "authentication", "auth", "cookie", "set-cookie",
+            "session", "session-id", "sessionid",
+        }
+
+        auth_related_keywords = [
+            "login", "signin", "sign_in", "auth", "authenticate",
+            "token", "issue_token", "gettoken", "get_token",
+            "oauth", "connect/token", "authorize",
+        ]
+
+        login_producer_id: Optional[str] = None
 
         for record in records:
             deps = set()
@@ -174,6 +187,7 @@ class Player:
                 except (UnicodeDecodeError, AttributeError):
                     pass
 
+            has_auth_header = False
             for h_key, h_value in record.headers.items():
                 if isinstance(h_value, str):
                     placeholders = re.findall(r'\{\{(\w+)\}\}', h_value)
@@ -181,11 +195,32 @@ class Player:
                         if var in var_producers:
                             deps.add(var_producers[var])
 
+                    h_lower = h_key.lower()
+                    if h_lower in auth_header_names:
+                        if h_value and len(h_value) > 4:
+                            has_auth_header = True
+
             if record.url:
                 placeholders = re.findall(r'\{\{(\w+)\}\}', record.url)
                 for var in placeholders:
                     if var in var_producers:
                         deps.add(var_producers[var])
+
+                from urllib.parse import urlparse
+                try:
+                    parsed_url = urlparse(record.url)
+                    path_lower = parsed_url.path.lower()
+                except Exception:
+                    path_lower = record.url.split("?")[0].lower()
+
+                is_login_request = any(kw in path_lower for kw in auth_related_keywords)
+                if is_login_request and hasattr(record, 'method') and record.method != "GET":
+                    login_producer_id = record.id
+                elif is_login_request and record.method == "GET":
+                    if not login_producer_id:
+                        login_producer_id = record.id
+                elif has_auth_header and login_producer_id and login_producer_id != record.id:
+                    deps.add(login_producer_id)
 
             dependencies[record.id] = list(deps)
 
@@ -193,7 +228,10 @@ class Player:
                 var_producers[rule.variable_name] = record.id
 
             if self.context_manager.enable_auto_extract:
-                auto_vars = ["auto_token", "auto_access_token", "auto_id", "auto_uuid"]
+                auto_vars = [
+                    "auto_token", "auto_access_token", "auto_id", "auto_uuid",
+                    "auto_x_auth_token", "auto_authorization", "auto_user_id",
+                ]
                 for v in auto_vars:
                     var_producers[v] = record.id
 

@@ -84,17 +84,24 @@ class Recorder:
         self._app = web.Application(middlewares=[self._recording_middleware])
         self._app.router.add_route("*", "/{path:.*}", self._handle_request)
 
-        runner = web.AppRunner(self._app)
-        await runner.setup()
-        site = web.TCPSite(runner, self.listen_host, self.listen_port)
-        await site.start()
+        self._runner = web.AppRunner(self._app)
+        await self._runner.setup()
+        if self.listen_port == 0:
+            import socket as _socket
+            s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            s.bind((self.listen_host, 0))
+            actual_port = s.getsockname()[1]
+            s.close()
+            self.listen_port = actual_port
+        self._site = web.TCPSite(self._runner, self.listen_host, self.listen_port)
+        await self._site.start()
 
         logger.info(
             f"Recorder started in {self.mode.value} mode on "
             f"{self.listen_host}:{self.listen_port} -> {self.target_url}"
         )
 
-    async def stop(self) -> None:
+    async def stop(self, graceful_wait_ms: int = 5000) -> None:
         if not self._running:
             return
 
@@ -102,6 +109,21 @@ class Recorder:
 
         if self._client_session:
             await self._client_session.close()
+
+        if self._record_queue is not None:
+            deadline = time.time() + graceful_wait_ms / 1000
+            while not self._record_queue.empty() and time.time() < deadline:
+                await asyncio.sleep(0.05)
+
+            remaining = self._record_queue.qsize()
+            if remaining > 0:
+                logger.warning(f"Queue still has {remaining} items after graceful wait, flushing directly")
+                for _ in range(remaining):
+                    try:
+                        record = self._record_queue.get_nowait()
+                        await self.storage.append(record)
+                    except asyncio.QueueEmpty:
+                        break
 
         for task in self._worker_tasks:
             task.cancel()
@@ -114,7 +136,8 @@ class Recorder:
 
         logger.info(
             f"Recorder stopped. Recorded: {self._request_count}, "
-            f"Skipped: {self._skipped_count}"
+            f"Skipped: {self._skipped_count}, "
+            f"Written: {self.storage._records_written}"
         )
 
     @web.middleware
