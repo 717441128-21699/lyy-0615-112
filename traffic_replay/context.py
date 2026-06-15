@@ -313,6 +313,8 @@ class ContextManager:
 
         new_headers = self._auto_inject_headers(new_headers, context)
         new_body = self._auto_inject_body(new_body, context)
+        new_headers = self._auto_inject_cookie(new_headers, context)
+        new_url = self._auto_inject_url_query(new_url, context)
 
         new_url = self._apply_env_mapping(new_url, context)
         new_headers = self._apply_env_mapping_to_headers(new_headers, context)
@@ -375,18 +377,6 @@ class ContextManager:
             if not has_x_auth and not has_auth and not has_token:
                 new_headers["X-Auth-Token"] = token_value
 
-        cookie_vars = [k for k in vars_lower if "cookie" in k or "session" in k]
-        if cookie_vars:
-            cookie_value = str(vars_lower[cookie_vars[0]])
-            has_cookie = False
-            for h_key in new_headers:
-                if h_key.lower() == "cookie":
-                    new_headers[h_key] = cookie_value
-                    has_cookie = True
-                    break
-            if not has_cookie and "=" in cookie_value:
-                new_headers["Cookie"] = cookie_value
-
         return new_headers
 
     def _auto_inject_body(
@@ -438,6 +428,131 @@ class ContextManager:
             return [self._auto_inject_json(item, context) for item in data]
         else:
             return data
+
+    def _auto_inject_url_query(
+        self, url: str, context: SessionContext
+    ) -> str:
+        if not url or not context.variables or "?" not in url:
+            return url
+
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+        try:
+            parsed = urlparse(url)
+            if not parsed.query:
+                return url
+        except Exception:
+            return url
+
+        vars_lower = {k.lower(): v for k, v in context.variables.items()}
+
+        token_value = None
+        for var_name in ["auth_token", "auto_auth_token", "access_token", "auto_access_token",
+                         "auto_x_auth_token", "auto_token", "token", "auto_authorization"]:
+            if var_name in vars_lower:
+                token_value = str(vars_lower[var_name])
+                break
+
+        user_id_value = None
+        for var_name in ["user_id", "auto_user_id", "uid", "auto_id", "auto_uuid"]:
+            if var_name in vars_lower:
+                user_id_value = str(vars_lower[var_name])
+                break
+
+        if not token_value and not user_id_value:
+            return url
+
+        try:
+            query_params = parse_qs(parsed.query, keep_blank_values=True)
+        except Exception:
+            return url
+
+        modified = False
+        sensitive_token_keys = {"token", "auth", "access_token", "accesstoken",
+                                "jwt", "auth_token", "authtoken", "session_token",
+                                "sessiontoken", "apikey", "api_key", "api-token"}
+
+        sensitive_id_keys = {"user_id", "userid", "uid", "account_id", "accountid"}
+
+        for q_key in list(query_params.keys()):
+            q_lower = q_key.lower().replace("-", "_")
+
+            if token_value and q_lower in sensitive_token_keys:
+                query_params[q_key] = [token_value]
+                modified = True
+            elif user_id_value and q_lower in sensitive_id_keys:
+                query_params[q_key] = [user_id_value]
+                modified = True
+
+        if not modified:
+            return url
+
+        try:
+            new_query = urlencode(query_params, doseq=True)
+            return urlunparse(parsed._replace(query=new_query))
+        except Exception:
+            return url
+
+    def _auto_inject_cookie(
+        self, headers: Dict[str, str], context: SessionContext
+    ) -> Dict[str, str]:
+        if not headers or not context.variables:
+            return headers
+
+        vars_lower = {k.lower(): v for k, v in context.variables.items()}
+
+        token_value = None
+        for var_name in ["auth_token", "auto_auth_token", "access_token", "auto_access_token",
+                         "auto_x_auth_token", "auto_token", "token"]:
+            if var_name in vars_lower:
+                token_value = str(vars_lower[var_name])
+                break
+
+        if not token_value:
+            return headers
+
+        new_headers = dict(headers)
+
+        for h_key in list(new_headers.keys()):
+            if h_key.lower() != "cookie":
+                continue
+
+            cookie_str = new_headers[h_key]
+            cookie_parts = [p.strip() for p in cookie_str.split(";")]
+            new_parts = []
+            modified = False
+
+            token_cookie_keywords = ("token", "session", "sid", "auth",
+                                      "jwt", "access", "cookie")
+
+            for part in cookie_parts:
+                if "=" not in part:
+                    new_parts.append(part)
+                    continue
+                try:
+                    c_name, c_val = part.split("=", 1)
+                    c_lower = c_name.strip().lower().replace("-", "_")
+                    is_auth_cookie = False
+                    if c_lower == "token" or c_lower == "session" or c_lower == "auth":
+                        is_auth_cookie = True
+                    else:
+                        for kw in token_cookie_keywords:
+                            if kw in c_lower:
+                                is_auth_cookie = True
+                                break
+                    if is_auth_cookie and len(c_val) > 3:
+                        new_parts.append(f"{c_name.strip()}={token_value}")
+                        modified = True
+                    else:
+                        new_parts.append(part)
+                except (ValueError, IndexError):
+                    new_parts.append(part)
+
+            if modified:
+                new_headers[h_key] = "; ".join(new_parts)
+                break
+
+        return new_headers
 
     def _is_json(self, s: str) -> bool:
         s = s.strip()

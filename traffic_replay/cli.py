@@ -339,28 +339,101 @@ def export(ctx: click.Context, session: str, output: Optional[str], fmt: str) ->
             for record in records:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
     elif fmt == "har":
+        entries = []
+        for record in records:
+            req_body = record.get("body")
+            if req_body is None:
+                req_body_size = 0
+                req_body_b64 = ""
+            elif isinstance(req_body, bytes):
+                req_body_size = len(req_body)
+                import base64
+                req_body_b64 = base64.b64encode(req_body).decode("ascii")
+            else:
+                req_body_str = str(req_body)
+                req_body_size = len(req_body_str.encode("utf-8"))
+                import base64
+                req_body_b64 = base64.b64encode(req_body_str.encode("utf-8")).decode("ascii")
+
+            resp_body = record.get("response_body")
+            if resp_body is None:
+                resp_body_size = 0
+                resp_body_b64 = ""
+            elif isinstance(resp_body, bytes):
+                resp_body_size = len(resp_body)
+                import base64
+                resp_body_b64 = base64.b64encode(resp_body).decode("ascii")
+            else:
+                resp_body_str = str(resp_body)
+                resp_body_size = len(resp_body_str.encode("utf-8"))
+                import base64
+                resp_body_b64 = base64.b64encode(resp_body_str.encode("utf-8")).decode("ascii")
+
+            query_list = []
+            try:
+                from urllib.parse import urlparse, parse_qs
+                parsed_url = urlparse(record["url"])
+                qs = parse_qs(parsed_url.query)
+                for qk, qvs in qs.items():
+                    for qv in qvs:
+                        query_list.append({"name": qk, "value": qv})
+            except Exception:
+                pass
+
+            try:
+                from datetime import datetime
+                ts = record.get("timestamp", 0)
+                if isinstance(ts, (int, float)):
+                    started = datetime.fromtimestamp(ts).isoformat(timespec="milliseconds") + "Z"
+                else:
+                    started = str(ts)
+            except Exception:
+                started = str(record.get("timestamp", ""))
+
+            entry = {
+                "startedDateTime": started,
+                "time": float(record.get("duration_ms", 0) or 0),
+                "request": {
+                    "method": record["method"],
+                    "url": record["url"],
+                    "httpVersion": "HTTP/1.1",
+                    "headers": [{"name": k, "value": str(v)} for k, v in record["headers"].items()],
+                    "queryString": query_list,
+                    "cookies": [],
+                    "headersSize": -1,
+                    "bodySize": req_body_size,
+                },
+                "response": {
+                    "status": int(record.get("response_status", 0) or 0),
+                    "statusText": "OK" if 200 <= int(record.get("response_status", 0) or 0) < 400 else "",
+                    "httpVersion": "HTTP/1.1",
+                    "headers": [{"name": k, "value": str(v)} for k, v in record.get("response_headers", {}).items()],
+                    "cookies": [],
+                    "content": {
+                        "size": resp_body_size,
+                        "mimeType": record.get("response_headers", {}).get("Content-Type", "application/octet-stream"),
+                        "text": resp_body_b64,
+                        "encoding": "base64",
+                    },
+                    "redirectURL": "",
+                    "headersSize": -1,
+                    "bodySize": resp_body_size,
+                },
+                "cache": {},
+                "timings": {
+                    "send": 0,
+                    "wait": float(record.get("upstream_latency_ms", record.get("duration_ms", 0)) or 0),
+                    "receive": 0,
+                },
+            }
+            entries.append(entry)
+
         har = {
             "log": {
                 "version": "1.2",
                 "creator": {"name": "traffic-replay", "version": "0.1.0"},
-                "entries": [
-                    {
-                        "startedDateTime": record["timestamp"],
-                        "time": record.get("duration_ms", 0),
-                        "request": {
-                            "method": record["method"],
-                            "url": record["url"],
-                            "headers": [{"name": k, "value": v} for k, v in record["headers"].items()],
-                            "bodySize": len(record.get("body", "") or 0),
-                        },
-                        "response": {
-                            "status": record.get("response_status", 0),
-                            "headers": [{"name": k, "value": v} for k, v in record.get("response_headers", {}).items()],
-                            "bodySize": len(record.get("response_body", "") or 0),
-                        },
-                    }
-                    for record in records
-                ],
+                "pages": [],
+                "entries": entries,
             }
         }
         with open(output, "w", encoding="utf-8") as f:

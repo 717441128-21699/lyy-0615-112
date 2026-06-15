@@ -52,6 +52,8 @@ class Recorder:
         self._client_session: Optional[ClientSession] = None
         self._record_queue: Optional[asyncio.Queue] = None
         self._worker_tasks: List[asyncio.Task] = []
+        self._inflight_requests: set = set()
+        self._inflight_lock = asyncio.Lock()
         self._running = False
         self._request_count = 0
         self._skipped_count = 0
@@ -107,11 +109,28 @@ class Recorder:
 
         self._running = False
 
+        if self._runner is not None:
+            try:
+                await self._runner.cleanup()
+            except Exception:
+                pass
+
+        deadline = time.time() + graceful_wait_ms / 1000
+        inflight_check_interval = 0.05
+        while self._inflight_requests and time.time() < deadline:
+            await asyncio.sleep(inflight_check_interval)
+
+        remaining_inflight = len(self._inflight_requests)
+        if remaining_inflight > 0:
+            logger.warning(
+                f"{remaining_inflight} in-flight requests still pending after "
+                f"{graceful_wait_ms}ms, stopping anyway"
+            )
+
         if self._client_session:
             await self._client_session.close()
 
         if self._record_queue is not None:
-            deadline = time.time() + graceful_wait_ms / 1000
             while not self._record_queue.empty() and time.time() < deadline:
                 await asyncio.sleep(0.05)
 
@@ -149,33 +168,42 @@ class Recorder:
 
     async def _handle_request(self, request: web.Request) -> web.Response:
         import random
-        if random.random() > self.sample_rate:
-            self._skipped_count += 1
-            return await self._proxy_request(request)
+        req_id = str(uuid.uuid4())
 
-        self._request_count += 1
-
-        record = RequestRecord(
-            id=str(uuid.uuid4()),
-            timestamp=time.time(),
-            method=request.method,
-            url=str(request.url),
-            headers=dict(request.headers),
-            session_id=request.headers.get("X-Session-Id"),
-            trace_id=request.headers.get("X-Trace-Id", request.headers.get("X-Request-Id")),
-        )
+        async with self._inflight_lock:
+            self._inflight_requests.add(req_id)
 
         try:
-            body = await request.read()
-            if len(body) <= self.max_body_size:
-                record.body = body
-            else:
-                record.tags["body_truncated"] = "true"
-                record.body = body[:self.max_body_size]
-        except Exception as e:
-            logger.warning(f"Failed to read request body: {e}")
+            if random.random() > self.sample_rate:
+                self._skipped_count += 1
+                return await self._proxy_request(request)
 
-        return await self._proxy_request(request, record, body=record.body)
+            self._request_count += 1
+
+            record = RequestRecord(
+                id=req_id,
+                timestamp=time.time(),
+                method=request.method,
+                url=str(request.url),
+                headers=dict(request.headers),
+                session_id=request.headers.get("X-Session-Id"),
+                trace_id=request.headers.get("X-Trace-Id", request.headers.get("X-Request-Id")),
+            )
+
+            try:
+                body = await request.read()
+                if len(body) <= self.max_body_size:
+                    record.body = body
+                else:
+                    record.tags["body_truncated"] = "true"
+                    record.body = body[:self.max_body_size]
+            except Exception as e:
+                logger.warning(f"Failed to read request body: {e}")
+
+            return await self._proxy_request(request, record, body=record.body)
+        finally:
+            async with self._inflight_lock:
+                self._inflight_requests.discard(req_id)
 
     async def _proxy_request(
         self, request: web.Request, record: Optional[RequestRecord] = None,

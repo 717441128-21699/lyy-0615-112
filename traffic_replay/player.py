@@ -109,6 +109,21 @@ class Player:
         filter_tags: Optional[Dict[str, str]] = None,
         loop_count: int = 1,
     ) -> PlaybackReport:
+        self._stats = {
+            "total": 0,
+            "success": 0,
+            "failed": 0,
+            "latencies": [],
+        }
+        self._results = []
+        self._errors = []
+        self._timing_deviations = []
+
+        if self.context_manager:
+            for ctx_id in list(self.context_manager._contexts.keys()):
+                if ctx_id.startswith("playback_"):
+                    del self.context_manager._contexts[ctx_id]
+
         await self.start()
 
         if records is None:
@@ -188,6 +203,7 @@ class Player:
                     pass
 
             has_auth_header = False
+            has_cookie_token = False
             for h_key, h_value in record.headers.items():
                 if isinstance(h_value, str):
                     placeholders = re.findall(r'\{\{(\w+)\}\}', h_value)
@@ -200,18 +216,45 @@ class Player:
                         if h_value and len(h_value) > 4:
                             has_auth_header = True
 
+                    if h_lower == "cookie":
+                        cookie_vals = [cv.strip() for cv in h_value.split(";")]
+                        for cv in cookie_vals:
+                            cvl = cv.lower()
+                            if ("token" in cvl or "session" in cvl or "auth" in cvl or "sid" in cvl) and "=" in cv:
+                                try:
+                                    c_val = cv.split("=", 1)[1]
+                                    if len(c_val) > 4:
+                                        has_cookie_token = True
+                                        break
+                                except (ValueError, IndexError):
+                                    pass
+
+            has_query_token = False
             if record.url:
                 placeholders = re.findall(r'\{\{(\w+)\}\}', record.url)
                 for var in placeholders:
                     if var in var_producers:
                         deps.add(var_producers[var])
 
-                from urllib.parse import urlparse
+                from urllib.parse import urlparse, parse_qs
                 try:
                     parsed_url = urlparse(record.url)
                     path_lower = parsed_url.path.lower()
+                    qs_lower = parsed_url.query.lower()
+                    query_vals = parse_qs(parsed_url.query)
                 except Exception:
                     path_lower = record.url.split("?")[0].lower()
+                    qs_lower = ""
+                    query_vals = {}
+
+                if "token" in qs_lower or "auth" in qs_lower or "session" in qs_lower or "access_key" in qs_lower:
+                    sensitive_query_keys = {"token", "auth", "session", "access_key", "jwt", "sid", "sessionid", "apikey", "api_key"}
+                    for qk in query_vals:
+                        if qk.lower() in sensitive_query_keys or "token" in qk.lower() or "auth" in qk.lower():
+                            qv_list = query_vals[qk]
+                            if qv_list and any(len(v) > 4 for v in qv_list):
+                                has_query_token = True
+                                break
 
                 is_login_request = any(kw in path_lower for kw in auth_related_keywords)
                 if is_login_request and hasattr(record, 'method') and record.method != "GET":
@@ -219,7 +262,7 @@ class Player:
                 elif is_login_request and record.method == "GET":
                     if not login_producer_id:
                         login_producer_id = record.id
-                elif has_auth_header and login_producer_id and login_producer_id != record.id:
+                elif (has_auth_header or has_cookie_token or has_query_token) and login_producer_id and login_producer_id != record.id:
                     deps.add(login_producer_id)
 
             dependencies[record.id] = list(deps)
